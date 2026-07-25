@@ -1,0 +1,17 @@
+[Unit]
+Description=Site Sentinel node agent (probe telemetry)
+After=network-online.target ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sitesentinel/agent.env
+ExecStart=/usr/bin/python3 /opt/sitesentinel/sitesentinel-agent.py
+Restart=always
+RestartSec=30
+# Root for mmcli (ModemManager polkit). Hardening to a dedicated user with a
+# polkit rule is future work.
+User=root
+
+[Install]
+WantedBy=multi-user.target
