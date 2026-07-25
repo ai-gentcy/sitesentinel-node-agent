@@ -18,10 +18,13 @@ library**, run as a systemd service.
 
 ## Install
 
+One command, no git needed (Raspberry Pi OS Lite ships without it):
+
 ```sh
-git clone <this-repo> && cd <this-repo>
-sudo ./install.sh
+wget -qO- https://raw.githubusercontent.com/ai-gentcy/sitesentinel-node-agent/main/bootstrap.sh | sudo sh
 ```
+
+Or, from a clone/tarball of this repo: `sudo ./install.sh`
 
 The installer copies the agent to `/opt/sitesentinel/`, installs and starts the
 `sitesentinel-agent` systemd service, and prints the node's **registration
