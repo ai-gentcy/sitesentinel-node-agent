@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -217,6 +218,56 @@ class TestUpdateProblem(unittest.TestCase):
     def test_malformed_refused(self):
         self.assertIsNotNone(agent.update_problem(None, "0.1.0"))
         self.assertIsNotNone(agent.update_problem({}, "0.1.0"))
+
+    def test_blocked_version_refused(self):
+        self.assertIn("previously failed", agent.update_problem(self.GOOD, "0.1.0", blocked="9.9.9"))
+        self.assertIsNone(agent.update_problem(self.GOOD, "0.1.0", blocked="8.8.8"))
+
+
+class TestTrialRollback(unittest.TestCase):
+    """commit_update / rollback_update against throwaway files (explicit target
+    so the real agent source is never touched)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.target = self.dir / "agent.py"
+        self.target.write_text("print('new version')")
+        # Point the module's state paths into the sandbox.
+        self._trial, self._blocked = agent.TRIAL_PATH, agent.BLOCKED_PATH
+        agent.TRIAL_PATH = self.dir / "update_pending.json"
+        agent.BLOCKED_PATH = self.dir / "update_blocked.json"
+
+    def tearDown(self):
+        agent.TRIAL_PATH, agent.BLOCKED_PATH = self._trial, self._blocked
+
+    def test_rollback_restores_bak_and_blocks_version(self):
+        (self.dir / "agent.py.bak").write_text("print('old version')")
+        agent.write_json_atomic(agent.TRIAL_PATH, {"version": "9.9.9", "ts": 1})
+        self.assertTrue(agent.rollback_update(self.target))
+        self.assertEqual(self.target.read_text(), "print('old version')")
+        self.assertFalse((self.dir / "agent.py.bak").exists())
+        self.assertFalse(agent.TRIAL_PATH.exists())
+        self.assertEqual(json.loads(agent.BLOCKED_PATH.read_text())["version"], "9.9.9")
+
+    def test_rollback_without_bak_is_noop(self):
+        agent.write_json_atomic(agent.TRIAL_PATH, {"version": "9.9.9", "ts": 1})
+        self.assertFalse(agent.rollback_update(self.target))
+        self.assertEqual(self.target.read_text(), "print('new version')")
+        self.assertFalse(agent.TRIAL_PATH.exists())  # marker still cleared
+
+    def test_commit_clears_marker_and_bak(self):
+        (self.dir / "agent.py.bak").write_text("old")
+        agent.write_json_atomic(agent.TRIAL_PATH, {"version": "9.9.9", "ts": 1})
+        agent.commit_update(self.target)
+        self.assertFalse((self.dir / "agent.py.bak").exists())
+        self.assertFalse(agent.TRIAL_PATH.exists())
+        self.assertEqual(self.target.read_text(), "print('new version')")
+
+    def test_write_json_atomic_no_tmp_left(self):
+        p = self.dir / "state.json"
+        agent.write_json_atomic(p, {"a": 1})
+        self.assertEqual(json.loads(p.read_text()), {"a": 1})
+        self.assertEqual([f.name for f in self.dir.glob("*.tmp")], [])
 
 
 if __name__ == "__main__":

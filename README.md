@@ -126,6 +126,37 @@ Releases are cut by tagging this repository (e.g. `v0.3.0`) and registering
 the tag's raw file URL in the backoffice, which pins the hash at registration
 time — changing the file behind a URL later cannot reach the fleet.
 
+### A/B trial and automatic rollback
+
+Updates install A/B: the running version is kept as
+`sitesentinel-agent.py.bak` and the new one starts **on trial**
+(`/etc/sitesentinel/update_pending.json`). The trial commits — marker and
+backup removed — on the first successful heartbeat. If it can't get one:
+
+- **Runs but can't heartbeat** (runtime bug): after 5 failed heartbeats the
+  agent restores the backup itself and restarts.
+- **Crash-loops on startup**: systemd's start limit trips (4 starts / 10 min)
+  and `sitesentinel-agent-rollback.service` (wired via `OnFailure=`) restores
+  the backup and restarts the agent.
+
+Either way the failed version is recorded in
+`/etc/sitesentinel/update_blocked.json` and never retried on that node —
+recovery is publishing a new version number. A node can therefore never be
+permanently taken offline by a bad release.
+
+## Restart behaviour
+
+Every piece of state that matters survives restarts and power cuts:
+
+- systemd `Restart=always` + boot enablement; ordered after network and
+  ModemManager.
+- Identity (key + node id) persists in `credentials.json`; all state files are
+  written atomically (temp + rename), so a power cut can never corrupt them.
+- Clock offset is re-learned from the server after RTC-less cold boots.
+- A command interrupted mid-run is re-served by the server and re-executed.
+- An interrupted update download never touches the running script (staged as
+  `.new`, swapped atomically).
+
 ## Development
 
 ```sh

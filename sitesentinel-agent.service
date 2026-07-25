@@ -2,6 +2,12 @@
 Description=Site Sentinel node agent (probe telemetry)
 After=network-online.target ModemManager.service
 Wants=network-online.target
+# If the agent crash-loops (StartLimitBurst starts within StartLimitIntervalSec)
+# the unit enters "failed" and the rollback unit runs: it restores the previous
+# agent version when a just-installed update is on trial, then restarts us.
+StartLimitIntervalSec=600
+StartLimitBurst=4
+OnFailure=sitesentinel-agent-rollback.service
 
 [Service]
 Type=simple

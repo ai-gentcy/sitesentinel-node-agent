@@ -36,10 +36,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.4.0"
 
 SENTINEL_URL = os.environ.get("SENTINEL_URL", "https://nodes.sitesentinel.io").rstrip("/")
 CRED_PATH = Path(os.environ.get("SENTINEL_CRED_PATH", "/etc/sitesentinel/credentials.json"))
+# Update trial/rollback state lives next to the credentials so it survives
+# restarts and is shared with the systemd rollback unit.
+STATE_DIR = CRED_PATH.parent
+TRIAL_PATH = STATE_DIR / "update_pending.json"
+BLOCKED_PATH = STATE_DIR / "update_blocked.json"
 
 DEFAULT_INTERVAL_S = 60
 MAX_BACKOFF_S = 900
@@ -64,6 +69,22 @@ def fingerprint(node_key: str) -> str:
     return hashlib.sha256(node_key.encode()).hexdigest()
 
 
+def write_json_atomic(path: Path, data: dict) -> None:
+    """Temp-file + os.replace so a power cut mid-write can never corrupt state
+    (a torn credentials file would silently re-key the node)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, path)
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def parse_ping(output: str):
     """avg RTT + packet loss from Linux `ping` output; {} when unparseable."""
     out = {}
@@ -76,11 +97,12 @@ def parse_ping(output: str):
     return out
 
 
-def update_problem(update, current_version: str):
+def update_problem(update, current_version: str, blocked=None):
     """Why an OTA update offer must be refused (str), or None if it looks sound.
 
     Pure (no I/O) so it's unit-testable. https is required except in local dev
-    (SENTINEL_ALLOW_HTTP=1).
+    (SENTINEL_ALLOW_HTTP=1). `blocked` is a version that previously failed its
+    trial on this node (rolled back) — never retried; ship a new version number.
     """
     if not isinstance(update, dict):
         return "malformed update"
@@ -91,6 +113,8 @@ def update_problem(update, current_version: str):
         return "missing version"
     if version == current_version:
         return "already on this version"
+    if blocked and version == blocked:
+        return "version previously failed on this node"
     if not isinstance(url, str) or not (
         url.startswith("https://") or os.environ.get("SENTINEL_ALLOW_HTTP") == "1"
     ):
@@ -284,8 +308,7 @@ def load_credentials() -> dict:
 
 
 def save_credentials(creds: dict) -> None:
-    CRED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CRED_PATH.write_text(json.dumps(creds))
+    write_json_atomic(CRED_PATH, creds)
     os.chmod(CRED_PATH, 0o600)
 
 
@@ -439,22 +462,68 @@ def drain_commands(creds: dict, clock_offset: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OTA self-update (server-driven)
+# OTA self-update (server-driven), A/B with automatic rollback
 # ---------------------------------------------------------------------------
 # The heartbeat response carries {"update": {version, url, sha256}} when the
 # fleet's target release differs from AGENT_VERSION. The artifact is fetched,
 # hash-verified against the operator-registered sha256, byte-compiled as a
-# sanity check, then atomically swapped over this file; exiting lets systemd
-# (Restart=always) bring up the new version. Failed attempts for a version are
-# retried at most every UPDATE_COOLDOWN_S so a bad release can't hot-loop.
+# sanity check, then atomically swapped over this file — keeping the running
+# version as `<agent>.bak` and writing a trial marker. Exiting lets systemd
+# (Restart=always) bring up the new version, which runs ON TRIAL until its
+# first successful heartbeat commits it (marker + .bak removed). If the trial
+# version can't heartbeat (TRIAL_MAX_FAILURES) it rolls itself back; if it
+# crash-loops before it can, systemd's OnFailure rollback unit restores the
+# .bak. Either path records the failed version in BLOCKED_PATH so it is never
+# retried — recovery is publishing a NEW version number.
 
 UPDATE_COOLDOWN_S = 1800
+TRIAL_MAX_FAILURES = 5
 _update_attempt = {"version": None, "ts": 0.0}
+
+
+def _bak_path(target: Path) -> Path:
+    return target.with_name(target.name + ".bak")
+
+
+def commit_update(target=None) -> None:
+    """The trial version proved itself — drop the marker and the fallback."""
+    target = target or Path(__file__).resolve()
+    try:
+        TRIAL_PATH.unlink(missing_ok=True)
+        _bak_path(target).unlink(missing_ok=True)
+    except OSError as e:
+        log(f"could not clear trial state: {e}")
+
+
+def rollback_update(target=None) -> bool:
+    """Restore the pre-update agent and block the failed version. True when a
+    rollback actually happened (caller should exit so systemd restarts)."""
+    target = target or Path(__file__).resolve()
+    bak = _bak_path(target)
+    trial = read_json(TRIAL_PATH)
+    if isinstance(trial, dict) and trial.get("version"):
+        write_json_atomic(BLOCKED_PATH, {"version": trial["version"], "ts": int(time.time())})
+    try:
+        TRIAL_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not bak.exists():
+        return False
+    try:
+        os.replace(bak, target)
+    except OSError as e:
+        log(f"rollback failed: {e}")
+        return False
+    log("rolled back to previous agent version")
+    return True
 
 
 def apply_update(update) -> bool:
     """Install the offered release. True = installed (caller should exit)."""
-    problem = update_problem(update, AGENT_VERSION)
+    blocked = read_json(BLOCKED_PATH)
+    problem = update_problem(
+        update, AGENT_VERSION, blocked.get("version") if isinstance(blocked, dict) else None
+    )
     if problem:
         if problem != "already on this version":
             log(f"update refused: {problem}")
@@ -488,6 +557,10 @@ def apply_update(update) -> bool:
             log("downloaded agent does not compile — refusing update")
             tmp.unlink(missing_ok=True)
             return False
+        # A/B: keep the proven version as .bak and mark the new one on trial
+        # BEFORE swapping, so a crash at any point leaves a recovery path.
+        _bak_path(target).write_bytes(target.read_bytes())
+        write_json_atomic(TRIAL_PATH, {"version": version, "ts": int(time.time())})
         os.replace(tmp, target)
     except (OSError, subprocess.SubprocessError) as e:
         log(f"update install failed: {e}")
@@ -496,7 +569,7 @@ def apply_update(update) -> bool:
         except OSError:
             pass
         return False
-    log(f"updated to {version} — exiting for systemd restart")
+    log(f"updated to {version} (on trial) — exiting for systemd restart")
     return True
 
 
@@ -505,6 +578,30 @@ def main() -> None:
     interval = DEFAULT_INTERVAL_S
     if not creds.get("node_id"):
         creds, interval = register(creds)
+
+    # Are we a freshly-installed update running on trial? The marker matching
+    # our own version means the swap completed; a mismatched marker is debris
+    # from an interrupted update (old version still running) — clear it.
+    trial_marker = read_json(TRIAL_PATH)
+    on_trial = isinstance(trial_marker, dict) and trial_marker.get("version") == AGENT_VERSION
+    if trial_marker is not None and not on_trial:
+        try:
+            TRIAL_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if on_trial:
+        log(f"{AGENT_VERSION} on trial — commits after first successful heartbeat")
+    trial_failures = 0
+
+    def trial_failed():
+        nonlocal trial_failures, on_trial
+        if not on_trial:
+            return
+        trial_failures += 1
+        if trial_failures >= TRIAL_MAX_FAILURES:
+            if rollback_update():
+                sys.exit(0)  # systemd restarts the restored version
+            on_trial = False  # nothing to roll back to; keep running
 
     clock_offset = 0  # server_ts - local, learned from 401 skew responses
     backoff = interval
@@ -519,6 +616,10 @@ def main() -> None:
         status, res = post("/heartbeat", body, headers)
 
         if status == 200:
+            if on_trial:
+                commit_update()
+                on_trial = False
+                log(f"{AGENT_VERSION} committed")
             interval = int(res.get("interval_s", interval))
             backoff = interval
             if res.get("update") and apply_update(res["update"]):
@@ -526,9 +627,11 @@ def main() -> None:
             drain_commands(creds, clock_offset)
             time.sleep(interval)
         elif status == 401 and res.get("error") == "skew" and "server_ts" in res:
+            # Benign (cold boot without RTC) — never counts against a trial.
             clock_offset = int(res["server_ts"]) - int(time.time())
             log(f"clock skew corrected (offset {clock_offset}s), retrying")
         elif status == 401:
+            trial_failed()
             # Our node_id is no longer accepted (e.g. the node was deleted and
             # re-added with the same hash) — fall back to registration.
             log("heartbeat unauthorized — re-registering")
@@ -536,9 +639,11 @@ def main() -> None:
             creds, interval = register(creds)
             backoff = interval
         elif status == 403:
+            trial_failed()
             log(f"node revoked/disabled — slow-polling every {REVOKED_POLL_S}s")
             time.sleep(REVOKED_POLL_S)
         else:
+            trial_failed()
             log(f"heartbeat failed (status={status}), retrying in {backoff}s")
             time.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_S)

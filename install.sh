@@ -16,6 +16,7 @@ if [ ! -f /etc/sitesentinel/agent.env ]; then
 fi
 
 cp sitesentinel-agent.service /etc/systemd/system/sitesentinel-agent.service
+cp sitesentinel-agent-rollback.service /etc/systemd/system/sitesentinel-agent-rollback.service
 systemctl daemon-reload
 systemctl enable --now sitesentinel-agent
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Site Sentinel agent rollback (restore previous version after a failed update)
+
+# Triggered by OnFailure= of sitesentinel-agent.service, i.e. only after the
+# agent crash-looped past its start limit. If a freshly-installed update is on
+# trial (update_pending.json + .bak exist), block that version and restore the
+# previous agent; in every case restart the agent so the node never stays dead.
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '\
+  if [ -f /etc/sitesentinel/update_pending.json ] && [ -f /opt/sitesentinel/sitesentinel-agent.py.bak ]; then \
+    cp /etc/sitesentinel/update_pending.json /etc/sitesentinel/update_blocked.json; \
+    mv /opt/sitesentinel/sitesentinel-agent.py.bak /opt/sitesentinel/sitesentinel-agent.py; \
+    rm -f /etc/sitesentinel/update_pending.json; \
+    echo "rolled back to previous agent version"; \
+  fi; \
+  systemctl restart sitesentinel-agent'
