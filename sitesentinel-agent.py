@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.4.1"
 
 SENTINEL_URL = os.environ.get("SENTINEL_URL", "https://nodes.sitesentinel.io").rstrip("/")
 CRED_PATH = Path(os.environ.get("SENTINEL_CRED_PATH", "/etc/sitesentinel/credentials.json"))
@@ -269,10 +269,16 @@ def read_modem():
 # ---------------------------------------------------------------------------
 
 def post(path: str, body: str, headers: dict):
+    # A real User-Agent matters: Cloudflare bot protection blocks the default
+    # "Python-urllib" UA with an HTML 403 before the request reaches the Worker.
     req = urllib.request.Request(
         SENTINEL_URL + path,
         data=body.encode(),
-        headers={"Content-Type": "application/json", **headers},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": f"sitesentinel-agent/{AGENT_VERSION}",
+            **headers,
+        },
         method="POST",
     )
     try:
@@ -342,7 +348,9 @@ def register(creds: dict):
             log(f"not registered yet (hash {fp[:16]}…) — retrying in {DEFAULT_INTERVAL_S}s")
             time.sleep(DEFAULT_INTERVAL_S)
             continue
-        if status == 403:
+        if status == 403 and res.get("error") == "revoked":
+            # Only OUR worker's JSON 403 means revoked. A bare/HTML 403 (e.g. an
+            # edge bot-protection block) is transient — fall through to backoff.
             log("node revoked/disabled — slow-polling")
             time.sleep(REVOKED_POLL_S)
             continue
@@ -638,7 +646,7 @@ def main() -> None:
             creds.pop("node_id", None)
             creds, interval = register(creds)
             backoff = interval
-        elif status == 403:
+        elif status == 403 and res.get("error") == "revoked":
             trial_failed()
             log(f"node revoked/disabled — slow-polling every {REVOKED_POLL_S}s")
             time.sleep(REVOKED_POLL_S)
