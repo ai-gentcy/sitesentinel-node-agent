@@ -158,5 +158,27 @@ class TestFingerprint(unittest.TestCase):
         self.assertRegex(agent.fingerprint(key), r"^[0-9a-f]{64}$")
 
 
+class TestUpdateProblem(unittest.TestCase):
+    GOOD = {"version": "9.9.9", "url": "https://example.com/agent.py", "sha256": "c" * 64}
+
+    def test_sound_offer_accepted(self):
+        self.assertIsNone(agent.update_problem(self.GOOD, "0.1.0"))
+
+    def test_same_version_refused(self):
+        self.assertEqual(agent.update_problem(self.GOOD, "9.9.9"), "already on this version")
+
+    def test_http_refused(self):
+        offer = {**self.GOOD, "url": "http://example.com/agent.py"}
+        self.assertIn("non-https", agent.update_problem(offer, "0.1.0"))
+
+    def test_bad_sha_refused(self):
+        self.assertIn("sha256", agent.update_problem({**self.GOOD, "sha256": "zz"}, "0.1.0"))
+        self.assertIn("sha256", agent.update_problem({**self.GOOD, "sha256": ""}, "0.1.0"))
+
+    def test_malformed_refused(self):
+        self.assertIsNotNone(agent.update_problem(None, "0.1.0"))
+        self.assertIsNotNone(agent.update_problem({}, "0.1.0"))
+
+
 if __name__ == "__main__":
     unittest.main()

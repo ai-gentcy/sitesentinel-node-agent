@@ -26,15 +26,17 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"
 
 SENTINEL_URL = os.environ.get("SENTINEL_URL", "https://nodes.sitesentinel.io").rstrip("/")
 CRED_PATH = Path(os.environ.get("SENTINEL_CRED_PATH", "/etc/sitesentinel/credentials.json"))
@@ -60,6 +62,30 @@ def sign(node_key: str, ts: int, body: str) -> str:
 def fingerprint(node_key: str) -> str:
     """The public registration hash an operator adds in the backoffice."""
     return hashlib.sha256(node_key.encode()).hexdigest()
+
+
+def update_problem(update, current_version: str):
+    """Why an OTA update offer must be refused (str), or None if it looks sound.
+
+    Pure (no I/O) so it's unit-testable. https is required except in local dev
+    (SENTINEL_ALLOW_HTTP=1).
+    """
+    if not isinstance(update, dict):
+        return "malformed update"
+    version = update.get("version")
+    url = update.get("url", "")
+    sha = str(update.get("sha256", "")).lower()
+    if not isinstance(version, str) or not version:
+        return "missing version"
+    if version == current_version:
+        return "already on this version"
+    if not isinstance(url, str) or not (
+        url.startswith("https://") or os.environ.get("SENTINEL_ALLOW_HTTP") == "1"
+    ):
+        return "refusing non-https artifact URL"
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        return "missing/malformed sha256"
+    return None
 
 
 def _num(v):
@@ -303,6 +329,68 @@ def build_heartbeat(ts: int) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# OTA self-update (server-driven)
+# ---------------------------------------------------------------------------
+# The heartbeat response carries {"update": {version, url, sha256}} when the
+# fleet's target release differs from AGENT_VERSION. The artifact is fetched,
+# hash-verified against the operator-registered sha256, byte-compiled as a
+# sanity check, then atomically swapped over this file; exiting lets systemd
+# (Restart=always) bring up the new version. Failed attempts for a version are
+# retried at most every UPDATE_COOLDOWN_S so a bad release can't hot-loop.
+
+UPDATE_COOLDOWN_S = 1800
+_update_attempt = {"version": None, "ts": 0.0}
+
+
+def apply_update(update) -> bool:
+    """Install the offered release. True = installed (caller should exit)."""
+    problem = update_problem(update, AGENT_VERSION)
+    if problem:
+        if problem != "already on this version":
+            log(f"update refused: {problem}")
+        return False
+    version = update["version"]
+    now = time.time()
+    if _update_attempt["version"] == version and now - _update_attempt["ts"] < UPDATE_COOLDOWN_S:
+        return False
+    _update_attempt["version"] = version
+    _update_attempt["ts"] = now
+
+    log(f"updating {AGENT_VERSION} -> {version}")
+    try:
+        with urllib.request.urlopen(update["url"], timeout=60) as r:
+            data = r.read()
+    except (urllib.error.URLError, OSError) as e:
+        log(f"update download failed: {e}")
+        return False
+    if hashlib.sha256(data).hexdigest() != str(update["sha256"]).lower():
+        log("update sha256 mismatch — refusing")
+        return False
+
+    target = Path(__file__).resolve()
+    tmp = target.with_suffix(".new")
+    try:
+        tmp.write_bytes(data)
+        check = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(tmp)], capture_output=True, timeout=60
+        )
+        if check.returncode != 0:
+            log("downloaded agent does not compile — refusing update")
+            tmp.unlink(missing_ok=True)
+            return False
+        os.replace(tmp, target)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"update install failed: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    log(f"updated to {version} — exiting for systemd restart")
+    return True
+
+
 def main() -> None:
     creds = load_credentials()
     interval = DEFAULT_INTERVAL_S
@@ -324,6 +412,8 @@ def main() -> None:
         if status == 200:
             interval = int(res.get("interval_s", interval))
             backoff = interval
+            if res.get("update") and apply_update(res["update"]):
+                sys.exit(0)  # systemd restarts us on the new version
             time.sleep(interval)
         elif status == 401 and res.get("error") == "skew" and "server_ts" in res:
             clock_offset = int(res["server_ts"]) - int(time.time())

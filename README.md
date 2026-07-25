@@ -92,6 +92,24 @@ endpoint). To re-key a device (e.g. after cloning an SD card), delete
 `/etc/sitesentinel/credentials.json`, restart the service, and register the
 newly logged hash.
 
+## Automatic updates
+
+The agent is versioned (`AGENT_VERSION`) and updates itself over the air. When
+the fleet's target release (registered by an operator in the Site Sentinel
+backoffice) differs from a node's running version, the next heartbeat response
+carries the new artifact's URL and SHA-256. The agent then:
+
+1. downloads the artifact (https only),
+2. verifies its SHA-256 against the operator-registered digest,
+3. byte-compiles it as a sanity check,
+4. atomically replaces itself and exits — systemd restarts it on the new
+   version.
+
+A failed attempt for a given version is retried at most every 30 minutes.
+Releases are cut by tagging this repository (e.g. `v0.3.0`) and registering
+the tag's raw file URL in the backoffice, which pins the hash at registration
+time — changing the file behind a URL later cannot reach the fleet.
+
 ## Development
 
 ```sh
