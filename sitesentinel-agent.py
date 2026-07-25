@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-AGENT_VERSION = "0.4.1"
+AGENT_VERSION = "0.4.2"
 
 SENTINEL_URL = os.environ.get("SENTINEL_URL", "https://nodes.sitesentinel.io").rstrip("/")
 CRED_PATH = Path(os.environ.get("SENTINEL_CRED_PATH", "/etc/sitesentinel/credentials.json"))
@@ -632,7 +632,10 @@ def main() -> None:
             backoff = interval
             if res.get("update") and apply_update(res["update"]):
                 sys.exit(0)  # systemd restarts us on the new version
-            drain_commands(creds, clock_offset)
+            # Roaming-data economy: only open the commands connection when the
+            # heartbeat response says the queue actually has work.
+            if res.get("commands"):
+                drain_commands(creds, clock_offset)
             time.sleep(interval)
         elif status == 401 and res.get("error") == "skew" and "server_ts" in res:
             # Benign (cold boot without RTC) — never counts against a trial.
