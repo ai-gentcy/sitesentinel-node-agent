@@ -18,7 +18,10 @@ fi
 cp sitesentinel-agent.service /etc/systemd/system/sitesentinel-agent.service
 cp sitesentinel-agent-rollback.service /etc/systemd/system/sitesentinel-agent-rollback.service
 systemctl daemon-reload
-systemctl enable --now sitesentinel-agent
+systemctl enable sitesentinel-agent
+# restart (not `enable --now`): on re-install the service is already running
+# and must pick up the newly copied agent.
+systemctl restart sitesentinel-agent
 
 echo ">> Installed. Registration hash (add it in the backoffice):"
 sleep 2
