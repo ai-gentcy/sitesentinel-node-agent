@@ -92,6 +92,22 @@ endpoint). To re-key a device (e.g. after cloning an SD card), delete
 `/etc/sitesentinel/credentials.json`, restart the service, and register the
 newly logged hash.
 
+## Probe commands
+
+Operators can queue measurement commands for a node (RIPE-Atlas style) from
+the Site Sentinel backoffice. Each command targets a **list of domains** and
+runs one action per domain:
+
+- `dns` — resolve the domain, report the IP set and lookup time
+- `http` — HTTPS GET, report status code, final URL and latency
+- `ping` — 3 ICMP probes, report average RTT and packet loss
+
+Commands execute **strictly in queue order, one at a time**: after every
+heartbeat the agent fetches the next command, runs it, uploads the per-domain
+results, and repeats until its queue is empty. If the agent restarts
+mid-command, the server re-serves the unfinished command. All command traffic
+uses the same HMAC authentication as heartbeats.
+
 ## Automatic updates
 
 The agent is versioned (`AGENT_VERSION`) and updates itself over the air. When

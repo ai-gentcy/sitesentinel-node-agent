@@ -158,6 +158,45 @@ class TestFingerprint(unittest.TestCase):
         self.assertRegex(agent.fingerprint(key), r"^[0-9a-f]{64}$")
 
 
+class TestParsePing(unittest.TestCase):
+    LINUX = (
+        "PING example.com (93.184.216.34) 56(84) bytes of data.\n"
+        "3 packets transmitted, 3 received, 0% packet loss, time 2003ms\n"
+        "rtt min/avg/max/mdev = 12.318/15.612/20.107/3.221 ms\n"
+    )
+
+    def test_linux_output(self):
+        p = agent.parse_ping(self.LINUX)
+        self.assertEqual(p["avg_ms"], 15.612)
+        self.assertEqual(p["loss_pct"], 0.0)
+
+    def test_partial_loss(self):
+        p = agent.parse_ping("3 packets transmitted, 1 received, 66.6% packet loss, time 2010ms\n")
+        self.assertEqual(p["loss_pct"], 66.6)
+        self.assertNotIn("avg_ms", p)
+
+    def test_garbage(self):
+        self.assertEqual(agent.parse_ping("Request timed out."), {})
+
+
+class TestExecuteCommand(unittest.TestCase):
+    def test_unsupported_type(self):
+        results, err = agent.execute_command({"type": "traceroute", "domains": ["example.com"]})
+        self.assertEqual(results, {})
+        self.assertIn("unsupported", err)
+
+    def test_empty_domains(self):
+        results, err = agent.execute_command({"type": "dns", "domains": []})
+        self.assertEqual(results, {})
+        self.assertIsNone(err)
+
+    def test_domains_normalized_and_capped(self):
+        cmd = {"type": "dns", "domains": ["  ", ""]}
+        results, err = agent.execute_command(cmd)
+        self.assertEqual(results, {})  # blank entries skipped
+        self.assertIsNone(err)
+
+
 class TestUpdateProblem(unittest.TestCase):
     GOOD = {"version": "9.9.9", "url": "https://example.com/agent.py", "sha256": "c" * 64}
 

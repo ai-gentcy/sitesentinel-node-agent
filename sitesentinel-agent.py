@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.3.0"
 
 SENTINEL_URL = os.environ.get("SENTINEL_URL", "https://nodes.sitesentinel.io").rstrip("/")
 CRED_PATH = Path(os.environ.get("SENTINEL_CRED_PATH", "/etc/sitesentinel/credentials.json"))
@@ -62,6 +62,18 @@ def sign(node_key: str, ts: int, body: str) -> str:
 def fingerprint(node_key: str) -> str:
     """The public registration hash an operator adds in the backoffice."""
     return hashlib.sha256(node_key.encode()).hexdigest()
+
+
+def parse_ping(output: str):
+    """avg RTT + packet loss from Linux `ping` output; {} when unparseable."""
+    out = {}
+    m = re.search(r"=\s*[\d.]+/([\d.]+)/[\d.]+", output)
+    if m:
+        out["avg_ms"] = float(m.group(1))
+    m = re.search(r"([\d.]+)%\s*packet loss", output)
+    if m:
+        out["loss_pct"] = float(m.group(1))
+    return out
 
 
 def update_problem(update, current_version: str):
@@ -330,6 +342,103 @@ def build_heartbeat(ts: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Probe commands (RIPE-Atlas-style measurements)
+# ---------------------------------------------------------------------------
+# The server keeps a per-node FIFO queue. After every successful heartbeat the
+# agent drains it: fetch next command, run it against each listed domain
+# IN ORDER, post the per-domain results, repeat until the queue is empty.
+# The server re-serves an unfinished command, so a crash mid-command just
+# means it runs again after restart.
+
+MAX_DOMAINS_PER_COMMAND = 50
+DRAIN_LIMIT = 20  # commands per heartbeat cycle — bounds a runaway queue
+
+
+def signed_post(path: str, body: str, creds: dict, clock_offset: int):
+    ts = int(time.time()) + clock_offset
+    return post(
+        path,
+        body,
+        {
+            "X-Sentinel-Node": creds["node_id"],
+            "X-Sentinel-Timestamp": str(ts),
+            "X-Sentinel-Signature": sign(creds["node_key"], ts, body),
+        },
+    )
+
+
+def action_dns(domain: str) -> dict:
+    t0 = time.time()
+    try:
+        infos = socket.getaddrinfo(domain, None)
+        ips = sorted({i[4][0] for i in infos})
+        return {"ips": ips, "ms": int((time.time() - t0) * 1000)}
+    except (socket.gaierror, OSError) as e:
+        return {"error": str(e), "ms": int((time.time() - t0) * 1000)}
+
+
+def action_http(domain: str) -> dict:
+    t0 = time.time()
+    req = urllib.request.Request(
+        f"https://{domain}/", headers={"User-Agent": f"sitesentinel-agent/{AGENT_VERSION}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read(65536)  # first chunk only — we care about reachability, not content
+            return {"status": r.status, "final_url": r.url, "ms": int((time.time() - t0) * 1000)}
+    except urllib.error.HTTPError as e:
+        return {"status": e.code, "final_url": e.url, "ms": int((time.time() - t0) * 1000)}
+    except (urllib.error.URLError, OSError) as e:
+        return {"error": str(e), "ms": int((time.time() - t0) * 1000)}
+
+
+def action_ping(domain: str) -> dict:
+    out = _run(["ping", "-c", "3", "-W", "2", domain])
+    if out is None:
+        return {"error": "ping unavailable or host unreachable"}
+    parsed = parse_ping(out)
+    return parsed if parsed else {"error": "could not parse ping output"}
+
+
+ACTIONS = {"dns": action_dns, "http": action_http, "ping": action_ping}
+
+
+def execute_command(cmd: dict):
+    """Run one command over its domain list. Returns (results, error)."""
+    action = ACTIONS.get(cmd.get("type"))
+    if action is None:
+        return {}, f"unsupported command type: {cmd.get('type')}"
+    results = {}
+    for domain in list(cmd.get("domains", []))[:MAX_DOMAINS_PER_COMMAND]:
+        d = str(domain).strip().lower()
+        if not d:
+            continue
+        results[d] = action(d)
+    return results, None
+
+
+def drain_commands(creds: dict, clock_offset: int) -> None:
+    for _ in range(DRAIN_LIMIT):
+        status, res = signed_post("/commands/next", "{}", creds, clock_offset)
+        if status != 200:
+            return
+        cmd = res.get("command")
+        if not cmd:
+            return
+        log(f"running command {cmd['id']} ({cmd.get('type')}, {len(cmd.get('domains', []))} domain(s))")
+        results, err = execute_command(cmd)
+        payload = {"command_id": cmd["id"], "results": results}
+        if err:
+            payload["error"] = err
+        status, _ = signed_post("/commands/result", json.dumps(payload), creds, clock_offset)
+        if status != 200:
+            # Leave the command running server-side; it is re-served next cycle.
+            log(f"result upload failed (status={status}) — will retry next cycle")
+            return
+        log(f"command {cmd['id']} done")
+
+
+# ---------------------------------------------------------------------------
 # OTA self-update (server-driven)
 # ---------------------------------------------------------------------------
 # The heartbeat response carries {"update": {version, url, sha256}} when the
@@ -414,6 +523,7 @@ def main() -> None:
             backoff = interval
             if res.get("update") and apply_update(res["update"]):
                 sys.exit(0)  # systemd restarts us on the new version
+            drain_commands(creds, clock_offset)
             time.sleep(interval)
         elif status == 401 and res.get("error") == "skew" and "server_ts" in res:
             clock_offset = int(res["server_ts"]) - int(time.time())
